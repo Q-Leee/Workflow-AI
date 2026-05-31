@@ -390,7 +390,8 @@ def _is_resume_skill_requirement(text: str) -> bool:
         r"\b(junit|mockito|jmockit|j2ee|ejb|struts|spring framework|spring boot|"
         r"apache camel|reactjs|\breact\b|postgresql|swagger|openapi|oauth|jwt|"
         r"jenkins|bitbucket|bamboo|ci/?cd|terraform|ansible|cloudwatch|amazon\s+eks|\beks\b|"
-        r"next\.?js|helm|gitops|devops|banking|financial services|enterprise|"
+        r"next\.?js|laravel|expo|php|forge|restful|graphql|micro[- ]?services?|"
+        r"helm|gitops|devops|banking|financial services|enterprise|"
         r"pytorch|tensorflow|opencv|computer vision|image processing|video analytics|"
         r"\bpython\b|version control|git\b|scikit-learn|nlp|postgraduate|masters?|"
         r"graduate diploma|data science|artificial intelligence|mcp\b|playwright|"
@@ -683,13 +684,63 @@ def _llm_item_is_grounded(req_text: str, jd_text: str) -> bool:
     return (matched / len(meaningful)) >= 0.35
 
 
-def parse_requirements(jd_text: str, *, max_items: int = 18) -> list[dict]:
+def _build_jd_rag_context(*, user_id: str, jd_document_id: str, jd_text: str) -> str:
+    """Hybrid (vector + BM25) retrieval over indexed JD chunks for LLM requirement extraction."""
+    from app.services import rag
+
+    if not settings.jd_parse_use_rag_context:
+        return ""
+
+    queries = [
+        "required skills qualifications experience education degree",
+        "key responsibilities duties technical stack",
+        "programming languages frameworks databases APIs tools",
+        "years of experience mandatory preferred bonus",
+        jd_text[:400] if jd_text else "job requirements",
+    ]
+    seen: set[str] = set()
+    blocks: list[str] = []
+    for q in queries:
+        try:
+            hits = rag.retrieve_and_rerank(
+                user_id=user_id,
+                question=q,
+                document_id=jd_document_id,
+                filename=None,
+                doc_type=None,
+                page_min=None,
+                page_max=None,
+                top_k=8,
+                do_rerank=settings.rerank_enabled,
+                expand_pages=False,
+            )
+        except Exception:
+            logger.exception("JD RAG context retrieval failed for query=%s", q[:60])
+            continue
+        for hit in hits:
+            if hit.chunk_id in seen:
+                continue
+            seen.add(hit.chunk_id)
+            blocks.append(hit.text.strip())
+    if not blocks:
+        return ""
+    return "\n\n".join(f"[JD excerpt {i}] {b}" for i, b in enumerate(blocks, start=1))
+
+
+def parse_requirements(
+    jd_text: str,
+    *,
+    max_items: int = 18,
+    rag_context: str | None = None,
+) -> list[dict]:
     """Extract hireable requirements only (skills, experience, duties) — not benefits/culture."""
     text = _normalize_jd_text(jd_text)
     if not text:
         return []
 
-    cache_key = hash_text("v15:" + normalize_text(jd_text))
+    cache_key = hash_text(
+        "v17-hybrid:" + normalize_text(jd_text) + "|" + normalize_text(rag_context or "")
+    )
     rule_items = _rule_extract_requirements(text, max_items)
 
     llm_items: list[dict] = []
@@ -708,21 +759,26 @@ def parse_requirements(jd_text: str, *, max_items: int = 18) -> list[dict]:
                 {
                     "role": "system",
                     "content": (
-                        "Extract ONLY technical requirements that are EXPLICITLY STATED in this job posting. "
-                        "CRITICAL RULE: Do NOT invent, infer, or add any requirements not directly written "
-                        "in the text. If a skill or tool is not mentioned, do not include it. "
-                        "Read these sections only: Qualifications, Requirements, Skills, "
-                        "Preferred/Nice to have, Minimum Qualifications. "
-                        "INCLUDE only: named languages, frameworks, databases, tools, degree requirements, "
-                        "years of experience — all must appear in the text. "
-                        "One requirement per distinct item. "
-                        "EXCLUDE: anything not in the text, benefits, EEO statements, soft skills, marketing. "
+                        "Extract technical requirements EXPLICITLY STATED in this job posting. "
+                        "Read the FULL posting including: The Role, Key Responsibilities, "
+                        "Requirements, Qualifications, Mandatory, Desired, Skills, and bullet lists. "
+                        "Each bullet under Key Responsibilities that names a technology or skill "
+                        "is its own requirement. "
+                        "Do NOT invent skills not in the text. "
+                        "One requirement per distinct skill, tool, framework, degree, or experience line. "
+                        "EXCLUDE: benefits, culture, EEO, salary, apply-now marketing. "
                         'Respond with ONLY valid JSON: '
                         '{"requirements": [{"text": string, "category": "skill"|"experience"|"education"|"other", '
                         '"priority": "required"|"preferred"}]}'
                     ),
                 },
-                {"role": "user", "content": text},
+                {
+                    "role": "user",
+                    "content": (
+                        (f"Retrieved JD excerpts (hybrid search):\n{rag_context}\n\n" if rag_context else "")
+                        + f"Full job posting:\n{text}"
+                    ),
+                },
             ]
         )
         parsed = llm.extract_json_block(raw or "")
@@ -733,7 +789,8 @@ def parse_requirements(jd_text: str, *, max_items: int = 18) -> list[dict]:
                     if norm and _llm_item_is_grounded(norm["text"], text):
                         norm["from_llm"] = True
                         llm_items.append(norm)
-        if settings.jd_parse_cache_enabled and llm_items and len(llm_items) >= 4:
+        min_cache = max(1, settings.jd_parse_min_items_for_cache)
+        if settings.jd_parse_cache_enabled and llm_items and len(llm_items) >= min_cache:
             _cache_set(cache_key, llm_items)
 
     # Union LLM + rules; prefer rules when LLM/cache returned too few items
@@ -749,7 +806,10 @@ def parse_requirements(jd_text: str, *, max_items: int = 18) -> list[dict]:
         norm = _normalize_item(item, from_llm=item.get("from_llm", False)) if "category" in item else None
         if norm:
             filtered.append(norm)
-        elif _is_real_requirement(t) and _is_resume_skill_requirement(t):
+        elif _is_real_requirement(t) and (
+            _is_resume_skill_requirement(t)
+            or (not item.get("from_llm") and jd_extract._is_scorable_line(t))
+        ):
             filtered.append(
                 {
                     "text": t,
@@ -768,8 +828,39 @@ def parse_requirements(jd_text: str, *, max_items: int = 18) -> list[dict]:
                         "priority": "required",
                     }
                 )
+    if len(filtered) < 3 and rule_items:
+        for item in rule_items:
+            t = str(item.get("text") or "").strip()
+            if len(t) < 12 or is_cover_letter_trait(t):
+                continue
+            if any(f["text"].lower() == t.lower() for f in filtered):
+                continue
+            filtered.append(
+                {
+                    "text": t,
+                    "category": item.get("category") or _infer_category(t),
+                    "priority": item.get("priority") or "required",
+                }
+            )
+
     merged = _sort_requirements(filtered)[:max_items]
     return requirement_knowledge.merge_semantic_clusters(merged)
+
+
+def parse_requirements_for_match(
+    jd_text: str,
+    *,
+    user_id: str,
+    jd_document_id: str,
+    max_items: int = 18,
+) -> list[dict]:
+    """Parse JD with optional hybrid RAG context (BM25 + vectors over indexed JD)."""
+    rag_ctx = _build_jd_rag_context(
+        user_id=user_id,
+        jd_document_id=jd_document_id,
+        jd_text=jd_text,
+    )
+    return parse_requirements(jd_text, max_items=max_items, rag_context=rag_ctx or None)
 
 
 def _collect_cover_letter_lines(lines: list[str]) -> list[str]:

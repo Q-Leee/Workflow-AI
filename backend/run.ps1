@@ -17,6 +17,6 @@ if (-not (Test-Path $venvUvicorn)) {
     & $venvPython -m pip install -r requirements.txt
 }
 
-Write-Host "Starting backend at http://127.0.0.1:8002 (venv Python)" -ForegroundColor Green
-Write-Host "Port 8002 avoids stale processes sometimes left on 8001." -ForegroundColor DarkGray
-& $venvUvicorn app.main:app --reload --host 127.0.0.1 --port 8002
+Write-Host "Starting backend at http://127.0.0.1:8003 (venv Python)" -ForegroundColor Green
+Write-Host "Use port 8003 if 8001/8002 show stale /health (ghost processes)." -ForegroundColor DarkGray
+& $venvUvicorn app.main:app --reload --host 127.0.0.1 --port 8003

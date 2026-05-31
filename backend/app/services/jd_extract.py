@@ -50,7 +50,8 @@ _TECHNICAL_LINE = re.compile(
     r"llm|ai\b|agent|rag|embed|vector|machine learning|automation|integrat|"
     r"architect|modular|production|deploy|degree|bachelor|master|graduate|"
     r"experience|years?|git|docker|kubernetes|eks|helm|terraform|ansible|"
-    r"cloudwatch|next\.?js|aws|azure|gcp|supabase|devops|gitops|ci/?cd|"
+    r"cloudwatch|next\.?js|laravel|expo|php|forge|micro[- ]?services?|aws|azure|gcp|"
+    r"supabase|devops|gitops|ci/?cd|"
     r"evaluat|rubric|prompt|security|privacy|session|firmware|embedded|c programming|"
     r"typescript|php|symfony|testing|ci/?cd|"
     r"data structures|algorithms|computer science|c\+\+|c#|programming|object[- ]oriented|oop|design patterns|system design|software development|science|engineering"
@@ -175,13 +176,23 @@ def extract_requirements(text: str, *, max_items: int = 18) -> list[dict]:
             continue
 
         if mode == "duty":
-            if _technical_responsibility(cleaned):
+            if _is_scorable_line(cleaned):
                 bullets.append(
                     {
                         "text": cleaned,
                         "priority": _infer_priority(cleaned, section_preferred=False),
                     }
                 )
+            continue
+
+        # Prose outside named sections (e.g. "The Role" intro) — still scorable if technical.
+        if mode is None and _is_scorable_line(cleaned):
+            bullets.append(
+                {
+                    "text": cleaned,
+                    "priority": _infer_priority(cleaned, section_preferred=False),
+                }
+            )
             continue
 
         if mode != "scorable":

@@ -65,7 +65,10 @@ def startup() -> None:
 def health():
     return {
         "status": "ok",
-        "rag_answer": "skills-fallback-v2",
+        "rag_answer": "skills-fallback-v3",
+        "api_port_hint": 8003,
+        "match_scoring": settings.match_scoring_mode,
+        "hybrid_search": settings.hybrid_search_enabled,
         "ollama_model": settings.ollama_chat_model,
     }
 

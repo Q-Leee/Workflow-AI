@@ -705,7 +705,10 @@ def _llm_judge_requirements_batch(
                     "You compare a RESUME to JOB REQUIREMENTS one row at a time. "
                     "Use semantic judgment: equivalent experience counts (e.g. Chroma + "
                     "hybrid BM25+vector + embeddings for 'vector search' or RAG in another stack; "
+                    "React Native may satisfy React/Expo; FastAPI/Node may satisfy REST APIs; "
                     "not only MySQL vector). "
+                    "When HYBRID RETRIEVAL excerpts are provided, treat them as primary evidence "
+                    "from BM25+vector search over the resume, then verify against the full resume. "
                     "Hard rules: "
                     "(1) Model Context Protocol (MCP) is NOT Google Cloud Platform (GCP). "
                     "Never explain MCP using GCP/Vertex. MCP is an AI tool-calling protocol; "
@@ -805,6 +808,50 @@ def _llm_judge_requirements_batch(
             )
         )
     return out
+
+
+def _match_requirements_hybrid(
+    *,
+    user_id: str,
+    resume_document_id: str,
+    requirements: list[dict],
+    resume_chunks: list[SourceChunk],
+) -> list[RequirementMatch]:
+    """
+    Hybrid scoring: BM25 + vector retrieval per requirement (match_retrieval), then
+    optional LLM batch judge using retrieval evidence + full resume context.
+    """
+    retrieval_matches: list[RequirementMatch] = [
+        match_retrieval.match_requirement(
+            user_id=user_id,
+            resume_document_id=resume_document_id,
+            requirement=req,
+            resume_chunks=resume_chunks,
+        )
+        for req in requirements
+    ]
+
+    if not settings.llm_enabled or not resume_chunks:
+        return retrieval_matches
+
+    resume_context = _build_resume_context(resume_chunks)
+    evidence_block = "\n\n--- HYBRID RETRIEVAL (BM25 + vector) per requirement ---\n"
+    for rm in retrieval_matches:
+        excerpt = (rm.resume_excerpt or "").strip() or "(no excerpt)"
+        evidence_block += (
+            f"\n• {rm.requirement[:120]}\n"
+            f"  retrieval: {rm.status} / {rm.score}% — {excerpt[:320]}\n"
+        )
+
+    judged = _llm_judge_requirements_batch(
+        resume_context=resume_context + evidence_block,
+        requirements=requirements,
+        resume_chunks=resume_chunks,
+    )
+    if judged and len(judged) == len(requirements):
+        return judged
+
+    return retrieval_matches
 
 
 def _match_requirements_with_llm_judge(
@@ -1096,10 +1143,23 @@ def match_resume_to_jd(
         expand_pages=False,
     )
 
-    requirements = jd_normalize.enrich_requirements(jd_parser.parse_requirements(jd_full_text))
+    requirements = jd_normalize.enrich_requirements(
+        jd_parser.parse_requirements_for_match(
+            jd_full_text,
+            user_id=user_id,
+            jd_document_id=jd_id,
+        )
+    )
     cover_letter_topics = jd_parser.parse_cover_letter_traits(jd_full_text)
     resume_chunks = _load_resume_chunks(user_id=user_id, document_id=resume_id)
-    scoring_mode = (settings.match_scoring_mode or "retrieval").strip().lower()
+    scoring_mode = (settings.match_scoring_mode or "hybrid").strip().lower()
+    use_hybrid = (
+        scoring_mode == "hybrid"
+        and use_llm
+        and settings.llm_enabled
+        and settings.match_use_llm_judge
+        and resume_chunks
+    )
     use_judge = (
         scoring_mode == "llm_judge"
         and use_llm
@@ -1107,7 +1167,14 @@ def match_resume_to_jd(
         and settings.match_use_llm_judge
         and resume_chunks
     )
-    if use_judge:
+    if use_hybrid:
+        requirement_matches = _match_requirements_hybrid(
+            user_id=user_id,
+            resume_document_id=resume_id,
+            requirements=requirements,
+            resume_chunks=resume_chunks,
+        )
+    elif use_judge:
         requirement_matches = _match_requirements_with_llm_judge(
             user_id=user_id,
             resume_document_id=resume_id,
@@ -1191,6 +1258,12 @@ def match_resume_to_jd(
             "such as Required Skills, Key skills & experience, or Technical Stack). "
             "Re-paste the JD or restart the backend after update. "
             "Score is 0% — not a reflection of your resume."
+        )
+    elif use_hybrid:
+        score_note = (
+            f"Score uses {req_count} requirements: hybrid BM25+vector retrieval on your resume, "
+            f"then LLM confirmation (semantic equivalents allowed). "
+            f"{trait_n} cover-letter topic(s) excluded from %."
         )
     elif use_judge:
         score_note = (

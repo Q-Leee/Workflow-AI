@@ -36,9 +36,12 @@ class Settings(BaseSettings):
     match_retrieval_stage1_top_k: int = 24
     match_reuse_indexed_docs: bool = True
     match_llm_summary_only: bool = True
-    # retrieval = ontology + 2-stage search + evidence; llm_judge = batched LLM scoring
-    match_scoring_mode: str = "retrieval"
-    match_use_llm_judge: bool = False
+    # hybrid = BM25+vector retrieval per requirement, then LLM confirms/adjusts
+    # retrieval = retrieval only; llm_judge = LLM-only batch (no retrieval pre-pass)
+    match_scoring_mode: str = "hybrid"
+    match_use_llm_judge: bool = True
+    jd_parse_use_rag_context: bool = True
+    jd_parse_min_items_for_cache: int = 4
     match_judge_batch_size: int = 8
     match_resume_context_max_chars: int = 14000
     match_strength_partial_min_score: float = 45.0
